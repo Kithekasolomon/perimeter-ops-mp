@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Perimeter Ops — PvP</title>
+<style>
+  html, body { margin:0; padding:0; overflow:hidden; background:#0a0e14; font-family:'Courier New',monospace; height:100%; touch-action:none; overscroll-behavior:none; }
+  #gameCanvas { display:block; background:radial-gradient(circle at center,#131a24 0%,#0a0e14 100%); cursor:crosshair; }
+  #hud { position:absolute; top:0; left:0; right:0; padding:16px 24px; display:flex; justify-content:space-between; color:#d7e3f4; pointer-events:none; text-shadow:0 0 6px rgba(0,0,0,0.8); }
+  .hud-label { color:#6fa8dc; font-size:11px; text-transform:uppercase; }
+  #healthBarWrap { width:200px; height:14px; background:#1a2330; border:1px solid #3a4a5c; border-radius:3px; overflow:hidden; margin-top:4px; }
+  #healthBar { height:100%; background:linear-gradient(90deg,#e74c3c,#f39c12); width:100%; transition:width 0.15s; }
+  #scoreRow { font-size:20px; text-align:right; }
+  #scoreRow span.red { color:#e74c3c; } #scoreRow span.blue { color:#4fd1c5; }
+  #connStatus { position:absolute; top:16px; left:50%; transform:translateX(-50%); font-size:12px; color:#6fa8dc; }
+  #centerMsg { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); text-align:center; color:#fff; }
+  #centerMsg h1 { font-size:38px; margin:0 0 10px; color:#4fd1c5; text-shadow:0 0 20px rgba(79,209,197,0.6); }
+  #centerMsg p { font-size:14px; color:#a9bacb; line-height:1.6; margin:4px 0; }
+  #queueBtn { margin-top:16px; pointer-events:all; cursor:pointer; background:#4fd1c5; color:#0a0e14; border:none; padding:12px 28px; font-family:inherit; font-weight:bold; font-size:15px; border-radius:4px; letter-spacing:1px; }
+  #queueBtn:disabled { background:#3a4a5c; cursor:default; }
+  #serverUrlInput { margin-top:14px; padding:8px; width:280px; font-family:inherit; background:#131a24; color:#d7e3f4; border:1px solid #3a4a5c; border-radius:4px; }
+  .touch-zone { position:absolute; bottom:24px; width:130px; height:130px; border-radius:50%; background:rgba(79,209,197,0.08); border:2px solid rgba(79,209,197,0.3); touch-action:none; display:none; }
+  #joystickZone { left:24px; }
+  #joystickStick { position:absolute; width:54px; height:54px; border-radius:50%; background:rgba(79,209,197,0.55); top:50%; left:50%; transform:translate(-50%,-50%); pointer-events:none; }
+  #fireZone { right:24px; background:rgba(231,76,60,0.1); border-color:rgba(231,76,60,0.35); align-items:center; justify-content:center; }
+  #fireZone span { color:#e74c3c; font-size:12px; letter-spacing:1px; pointer-events:none; }
+  @media (hover:none) and (pointer:coarse) { .touch-zone { display:flex; } }
+</style>
+</head>
+<body>
+<div style="position:relative;width:100vw;height:100vh;">
+  <canvas id="gameCanvas"></canvas>
+  <div id="connStatus">Not connected</div>
+  <div id="hud" style="display:none;">
+    <div>
+      <div class="hud-label">Hull Integrity</div>
+      <div id="healthBarWrap"><div id="healthBar"></div></div>
+    </div>
+    <div id="scoreRow"><span class="red" id="redScore">0</span> — <span class="blue" id="blueScore">0</span></div>
+  </div>
+  <div id="joystickZone" class="touch-zone"><div id="joystickStick"></div></div>
+  <div id="fireZone" class="touch-zone"><span>FIRE/AIM</span></div>
+  <div id="centerMsg">
+    <h1>PERIMETER OPS — PVP</h1>
+    <p>WASD to move · Mouse to aim · Click to fire</p>
+    <p>Server-authoritative. Squads of 2-4.</p>
+    <div><input id="serverUrlInput" placeholder="wss://your-server.up.railway.app" /></div>
+    <button id="queueBtn">FIND MATCH</button>
+    <p id="queueMsg"></p>
+  </div>
+</div>
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+function resize(){ canvas.width = innerWidth; canvas.height = innerHeight; }
+resize(); addEventListener('resize', resize);
+
+let ws = null;
+let myId = null;
+let myTeam = null;
+let mapSize = { w: 1600, h: 900 };
+let latestState = { players: [], bullets: [], scores: { red:0, blue:0 } };
+let connected = false;
+let inMatch = false;
+
+const input = { moveX:0, moveY:0, aimAngle:0, firing:false };
+const mouse = { x:0, y:0, down:false };
+const keys = {};
+
+function worldToScreen(x, y) {
+  const scaleX = canvas.width / mapSize.w;
+  const scaleY = canvas.height / mapSize.h;
+  const scale = Math.min(scaleX, scaleY);
+  const offX = (canvas.width - mapSize.w * scale) / 2;
+  const offY = (canvas.height - mapSize.h * scale) / 2;
+  return { x: x * scale + offX, y: y * scale + offY, scale };
+}
+function screenToWorld(x, y) {
+  const scaleX = canvas.width / mapSize.w;
+  const scaleY = canvas.height / mapSize.h;
+  const scale = Math.min(scaleX, scaleY);
+  const offX = (canvas.width - mapSize.w * scale) / 2;
+  const offY = (canvas.height - mapSize.h * scale) / 2;
+  return { x: (x - offX) / scale, y: (y - offY) / scale };
+}
+
+function connect(url) {
+  ws = new WebSocket(url);
+  ws.onopen = () => {
+    connected = true;
+    document.getElementById('connStatus').textContent = 'Connected';
+  };
+  ws.onclose = () => {
+    connected = false;
+    document.getElementById('connStatus').textContent = 'Disconnected';
+  };
+  ws.onerror = () => {
+    document.getElementById('queueMsg').textContent = 'Connection failed — check the server URL.';
+  };
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === 'welcome') {
+      myId = msg.playerId;
+    } else if (msg.type === 'queued') {
+      document.getElementById('queueMsg').textContent = `In queue... (${msg.position} waiting)`;
+    } else if (msg.type === 'match_start') {
+      myTeam = msg.team;
+      mapSize = msg.map;
+      inMatch = true;
+      document.getElementById('centerMsg').style.display = 'none';
+      document.getElementById('hud').style.display = 'flex';
+    } else if (msg.type === 'state') {
+      latestState = msg;
+      const me = msg.players.find(p => p.id === myId);
+      if (me) document.getElementById('healthBar').style.width = Math.max(0, me.health) + '%';
+      document.getElementById('redScore').textContent = msg.scores.red;
+      document.getElementById('blueScore').textContent = msg.scores.blue;
+    } else if (msg.type === 'match_end') {
+      inMatch = false;
+      const msgEl = document.getElementById('centerMsg');
+      msgEl.innerHTML = `<h1 style="color:${msg.winner==='red'?'#e74c3c':'#4fd1c5'}">${msg.winner.toUpperCase()} TEAM WINS</h1><p>${msg.scores.red} — ${msg.scores.blue}</p>`;
+      msgEl.style.display = 'block';
+      document.getElementById('hud').style.display = 'none';
+    }
+  };
+}
+
+document.getElementById('queueBtn').addEventListener('click', () => {
+  const url = document.getElementById('serverUrlInput').value.trim();
+  if (!url) { document.getElementById('queueMsg').textContent = 'Enter your server URL first.'; return; }
+  if (!connected) {
+    connect(url);
+    ws.addEventListener('open', () => ws.send(JSON.stringify({ type:'join_queue' })), { once:true });
+  } else {
+    ws.send(JSON.stringify({ type:'join_queue' }));
+  }
+  document.getElementById('queueBtn').disabled = true;
+});
+
+// input
+addEventListener('keydown', e => keys[e.key.toLowerCase()] = true);
+addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
+canvas.addEventListener('mousemove', e => {
+  const r = canvas.getBoundingClientRect();
+  mouse.x = e.clientX - r.left; mouse.y = e.clientY - r.top;
+});
+canvas.addEventListener('mousedown', () => mouse.down = true);
+canvas.addEventListener('mouseup', () => mouse.down = false);
+
+// touch joystick (movement)
+const joystickZone = document.getElementById('joystickZone');
+const joystickStick = document.getElementById('joystickStick');
+const fireZone = document.getElementById('fireZone');
+let joyId = null, aimId = null;
+let touchAim = { active:false, angle:0 };
+function zoneCenter(el){ const r = el.getBoundingClientRect(); return { x:r.left+r.width/2, y:r.top+r.height/2, radius:r.width/2 }; }
+joystickZone.addEventListener('touchstart', e => { e.preventDefault(); joyId = e.changedTouches[0].identifier; moveJoy(e.changedTouches[0]); }, {passive:false});
+joystickZone.addEventListener('touchmove', e => { e.preventDefault(); for (const t of e.changedTouches) if (t.identifier===joyId) moveJoy(t); }, {passive:false});
+function endJoy(e){ for (const t of e.changedTouches) if (t.identifier===joyId){ joyId=null; input.moveX=0; input.moveY=0; joystickStick.style.transform='translate(-50%,-50%)'; } }
+joystickZone.addEventListener('touchend', endJoy); joystickZone.addEventListener('touchcancel', endJoy);
+function moveJoy(t){ const c=zoneCenter(joystickZone); let dx=t.clientX-c.x, dy=t.clientY-c.y; const d=Math.hypot(dx,dy); if(d>c.radius){dx=dx/d*c.radius; dy=dy/d*c.radius;} input.moveX=dx/c.radius; input.moveY=dy/c.radius; joystickStick.style.transform=`translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px))`; }
+
+fireZone.addEventListener('touchstart', e => { e.preventDefault(); aimId = e.changedTouches[0].identifier; touchAim.active=true; aimMove(e.changedTouches[0]); }, {passive:false});
+fireZone.addEventListener('touchmove', e => { e.preventDefault(); for (const t of e.changedTouches) if (t.identifier===aimId) aimMove(t); }, {passive:false});
+function endAim(e){ for (const t of e.changedTouches) if (t.identifier===aimId){ aimId=null; touchAim.active=false; } }
+fireZone.addEventListener('touchend', endAim); fireZone.addEventListener('touchcancel', endAim);
+function aimMove(t){ const c=zoneCenter(fireZone); const dx=t.clientX-c.x, dy=t.clientY-c.y; if(Math.hypot(dx,dy)>6) touchAim.angle=Math.atan2(dy,dx); }
+
+// send input at a steady rate matching server tick
+setInterval(() => {
+  if (!connected || !inMatch || !ws || ws.readyState !== 1) return;
+
+  let dx=0, dy=0;
+  if (keys['w']) dy-=1; if (keys['s']) dy+=1; if (keys['a']) dx-=1; if (keys['d']) dx+=1;
+  if (joyId !== null) { dx += input.moveX; dy += input.moveY; }
+  const len = Math.hypot(dx,dy) || 1;
+  const norm = Math.min(1, Math.hypot(dx,dy));
+  input.moveX = (dx/len) * norm;
+  input.moveY = (dy/len) * norm;
+
+  const me = latestState.players.find(p => p.id === myId);
+  if (touchAim.active) {
+    input.aimAngle = touchAim.angle;
+  } else if (me) {
+    const screenPos = worldToScreen(me.x, me.y);
+    input.aimAngle = Math.atan2(mouse.y - screenPos.y, mouse.x - screenPos.x);
+  }
+  input.firing = mouse.down || touchAim.active;
+
+  ws.send(JSON.stringify({ type:'input', moveX:input.moveX, moveY:input.moveY, aimAngle:input.aimAngle, firing:input.firing }));
+}, 40); // 25hz, matches server tick
+
+function draw() {
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  // map bounds
+  const tl = worldToScreen(0,0), br = worldToScreen(mapSize.w, mapSize.h);
+  ctx.strokeStyle = 'rgba(79,209,197,0.25)';
+  ctx.strokeRect(tl.x, tl.y, br.x-tl.x, br.y-tl.y);
+
+  latestState.bullets.forEach(b => {
+    const p = worldToScreen(b.x, b.y);
+    ctx.save(); ctx.shadowColor = b.team==='red' ? '#e74c3c' : '#4fd1c5'; ctx.shadowBlur = 8;
+    ctx.fillStyle = '#fff8dc'; ctx.beginPath(); ctx.arc(p.x, p.y, 3, 0, Math.PI*2); ctx.fill(); ctx.restore();
+  });
+
+  latestState.players.forEach(pl => {
+    const p = worldToScreen(pl.x, pl.y);
+    if (!pl.alive) return;
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(pl.angle);
+    ctx.fillStyle = pl.team === 'red' ? '#e74c3c' : '#4fd1c5';
+    ctx.shadowColor = ctx.fillStyle; ctx.shadowBlur = pl.id===myId ? 14 : 6;
+    ctx.beginPath();
+    ctx.moveTo(18,0); ctx.lineTo(-12,-11); ctx.lineTo(-6,0); ctx.lineTo(-12,11);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+    // healthbar
+    ctx.fillStyle = '#1a2330'; ctx.fillRect(p.x-16, p.y-30, 32, 4);
+    ctx.fillStyle = pl.team==='red' ? '#e74c3c' : '#4fd1c5';
+    ctx.fillRect(p.x-16, p.y-30, 32*(pl.health/100), 4);
+    if (!pl.connected) { ctx.fillStyle='#f39c12'; ctx.font='10px Courier New'; ctx.fillText('DC', p.x-8, p.y-34); }
+  });
+
+  requestAnimationFrame(draw);
+}
+draw();
+</script>
+</body>
+</html>
